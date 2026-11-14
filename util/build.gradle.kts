@@ -142,6 +142,7 @@ kotlin {
                 implementation(libs.play.update.ktx)
                 implementation(libs.mixpanel.android)
                 implementation(libs.androidx.work)
+                implementation(libs.litertlm.android)
             }
         }
 

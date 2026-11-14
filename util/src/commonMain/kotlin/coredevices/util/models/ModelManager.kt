@@ -1,5 +1,6 @@
 package coredevices.util.models
 
+import DocumentAttachment
 import coredevices.util.CommonBuildKonfig
 import coredevices.util.Platform
 import coredevices.util.transcription.CactusModelPathProvider
@@ -24,6 +25,19 @@ class ModelManager(
 
     fun cancelDownload() {
         modelDownloadManager.cancelDownload()
+    }
+
+    /**
+     * Import a user-provided model bundle (zip stream) into app storage.
+     * Returns the model name it was stored under, or null when imports are unsupported.
+     */
+    suspend fun importModel(source: DocumentAttachment, onProgress: (Float) -> Unit = {}): String? {
+        return modelPathProvider?.importModel(source, onProgress)
+    }
+
+    /** Remove leftover temp files (failed imports, stale downloads, old transcription WAVs). Returns bytes freed. */
+    fun cleanupTempFiles(): Long {
+        return modelPathProvider?.cleanupTempFiles() ?: 0L
     }
 
     fun getDownloadedModelSlugs(): List<String> {
@@ -72,16 +86,30 @@ class ModelManager(
     suspend fun getAvailableSTTModels(): List<ModelInfo> {
         val sttModels = getSelectableSTTModels()
 
+        // User-imported bundles
+        val importedModels = modelPathProvider?.getImportedModels()
+            ?.map { imported ->
+                ModelInfo(
+                    slug = imported.name,
+                    sizeInMB = (imported.sizeBytes / (1024 * 1024)).toInt(),
+                    supportsMultiLanguage = true,
+                    imported = true,
+                    hasNpuEncoder = imported.hasNpuEncoder,
+                    displayName = imported.displayName,
+                )
+            } ?: emptyList()
+
         // Include old downloaded models (e.g. whisper) so they can be deleted
         val lmModel = CommonBuildKonfig.CACTUS_LM_MODEL_NAME
+        val importedNames = importedModels.map { it.slug }.toSet()
         val oldModels = modelPathProvider?.getDownloadedModels()
-            ?.filter { !sttModels.any { m -> m.slug == it } && it != lmModel }
+            ?.filter { !sttModels.any { m -> m.slug == it } && it != lmModel && it !in importedNames }
             ?.map { slug ->
                 val sizeMB = (modelPathProvider.getModelSizeBytes(slug) / (1024 * 1024)).toInt()
                 ModelInfo(slug = slug, sizeInMB = sizeMB)
             } ?: emptyList()
 
-        return sttModels + oldModels
+        return sttModels + importedModels + oldModels
     }
 
     suspend fun getAvailableLanguageModels(): List<ModelInfo> {
@@ -132,7 +160,8 @@ fun weightsVersionFor(modelSlug: String): String = when (modelSlug) {
     CommonBuildKonfig.CACTUS_STT_MODEL_ENG -> CommonBuildKonfig.CACTUS_STT_ENG_WEIGHTS_VERSION
     CommonBuildKonfig.CACTUS_LM_MODEL_NAME -> CommonBuildKonfig.CACTUS_LM_WEIGHTS_VERSION
     CommonBuildKonfig.CACTUS_STT_MODEL -> CommonBuildKonfig.CACTUS_STT_WEIGHTS_VERSION
-    else -> error("Unknown model: $modelSlug")
+    // Unknown slugs (e.g. user-imported or legacy models) have no pinned weights version.
+    else -> ""
 }
 
 data class ModelInfo(
@@ -141,7 +170,12 @@ data class ModelInfo(
     val slug: String,
     val sizeInMB: Int = 0,
     val url: String = "",
-    val supportsMultiLanguage: Boolean = false
+    val supportsMultiLanguage: Boolean = false,
+    /** True for bundles imported by the user from a file, not downloaded from Hugging Face. */
+    val imported: Boolean = false,
+    val hasNpuEncoder: Boolean = false,
+    /** Human-readable name shown for user-imported bundles; null falls back to [slug]. */
+    val displayName: String? = null,
 )
 
 expect fun Platform.supportsNPU(): Boolean

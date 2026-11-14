@@ -47,6 +47,7 @@ class HybridTranscriptionService(
     private val analytics: CoreAnalytics,
     private val platform: PlatformSpeechRecognizer,
     private val modelDownloads: ModelDownloadManager,
+    private val litert: LitertTranscriptionService? = null,
     private val networkConnection: Flow<String?>? = null,
 ) : LocalTranscriptionService {
     companion object {
@@ -92,6 +93,11 @@ class HybridTranscriptionService(
     // effect without restarting the app (not cached in a stateIn that nothing collects).
     private val sttConfig get() = coreConfigFlow.value.sttConfig
 
+    /** The local engine that on-device transcription should run on right now. */
+    private val litertSelected get() = sttConfig.litertModelName != null
+
+    private val activeLocalModel get() = sttConfig.litertModelName ?: sttConfig.modelName
+
     private val scope = CoroutineScope(Dispatchers.Default)
 
     private val lastErrorMutex = Mutex()
@@ -110,13 +116,17 @@ class HybridTranscriptionService(
     val configuredLanguage get() = sttConfig.spokenLanguage
     val lastSuccessfulMode get() = _lastSuccessfulMode
     val lastModelUsed get() = _lastModelUsed ?: cactus.lastModelUsed
-    val isModelReady get() = cactus.isModelReady
+    val isModelReady get() = if (litertSelected) litert?.isModelReady == true else cactus.isModelReady
 
     override val onInitialized: Channel<Boolean> get() = cactus.onInitialized
 
     override fun earlyInit() {
         val mode = sttConfig.mode
         if (!mode.usesLocalCactus()) return
+        if (litertSelected) {
+            litert?.earlyInit()
+            return
+        }
         if (shouldWarmUpLocalModel(mode, connection = null)) {
             cactus.earlyInit()
             return
@@ -131,9 +141,9 @@ class HybridTranscriptionService(
     override suspend fun isAvailable(): Boolean {
         return when (configuredMode) {
             CactusSTTMode.RemoteOnly -> wisprFlow.isAvailable() || kirinki.isAvailable()
-            CactusSTTMode.LocalOnly -> cactus.isLocalAvailable()
+            CactusSTTMode.LocalOnly -> localEngineAvailable()
             CactusSTTMode.RemoteFirst, CactusSTTMode.LocalFirst ->
-                wisprFlow.isAvailable() || kirinki.isAvailable() || cactus.isModelReady
+                wisprFlow.isAvailable() || kirinki.isAvailable() || localEngineAvailable()
             CactusSTTMode.PlatformOnly ->
                 (platform.isAvailable() && platform.isAuthorized()) ||
                     wisprFlow.isAvailable() || kirinki.isAvailable()
@@ -144,6 +154,17 @@ class HybridTranscriptionService(
         }
     }
 
+    /** Whether the currently selected local engine (LiteRT or Cactus) can transcribe. */
+    private fun localEngineAvailable(): Boolean = when {
+        litertSelected -> litert?.isLocalAvailable() == true
+        else -> cactus.isLocalAvailable()
+    }
+
+    private fun localEngineReady(): Boolean = when {
+        litertSelected -> litert?.isModelReady == true
+        else -> cactus.isModelReady
+    }
+
     private data class RoutedResult(
         val text: String?,
         val modeUsed: CactusSTTMode,
@@ -152,6 +173,11 @@ class HybridTranscriptionService(
     )
 
     private suspend fun remoteAvailable(): Boolean = wisprFlow.isAvailable() || kirinki.isAvailable()
+
+    private fun localModelAvailability(): SpeechModelAvailability = when {
+        litertSelected -> litert?.modelAvailability() ?: SpeechModelAvailability.NotDownloaded
+        else -> cactusModelAvailability()
+    }
 
     private fun cactusModelAvailability(): SpeechModelAvailability = when {
         cactus.isLocalAvailable() -> SpeechModelAvailability.Installed
@@ -287,12 +313,20 @@ class HybridTranscriptionService(
             )
 
         suspend fun local(cloudFallback: Boolean, reserve: Duration = Duration.ZERO): String =
-            onDeviceLeg(sttConfig.mode, cloudFallback, { cactusModelAvailability() }) {
-                cactus.transcribeLocal(
-                    audio,
-                    sampleRate,
-                    timeout = localTimeout(audio, sampleRate, remaining(), reserve),
-                )
+            onDeviceLeg(sttConfig.mode, cloudFallback, { localModelAvailability() }) {
+                if (litertSelected) {
+                    litert?.transcribeLocal(
+                        audio,
+                        sampleRate,
+                        timeout = localTimeout(audio, sampleRate, remaining(), reserve),
+                    ) ?: throw TranscriptionException.TranscriptionServiceUnavailable()
+                } else {
+                    cactus.transcribeLocal(
+                        audio,
+                        sampleRate,
+                        timeout = localTimeout(audio, sampleRate, remaining(), reserve),
+                    )
+                }
             }
 
         logger.d { "Using transcription mode ${sttConfig.mode}" }
@@ -303,7 +337,7 @@ class HybridTranscriptionService(
             }
             CactusSTTMode.LocalOnly -> {
                 val text = local(cloudFallback = false)
-                RoutedResult(text, sttMode, configuredModel)
+                RoutedResult(text, sttMode, activeLocalModel)
             }
             CactusSTTMode.PlatformOnly -> {
                 val languageTag = ((language as? STTLanguage.Specific)?.languageCodes?.firstOrNull()
@@ -354,7 +388,7 @@ class HybridTranscriptionService(
             CactusSTTMode.RemoteFirst -> {
                 suspend fun localFallback(remoteError: Exception): RoutedResult = try {
                     val text = local(cloudFallback = false)
-                    RoutedResult(text, CactusSTTMode.LocalOnly, configuredModel, localFallback = true)
+                    RoutedResult(text, CactusSTTMode.LocalOnly, activeLocalModel, localFallback = true)
                 } catch (_: TranscriptionException.TranscriptionRequiresDownload) {
                     throw remoteError
                 }
@@ -377,8 +411,8 @@ class HybridTranscriptionService(
                     val text = local(cloudFallback = remoteAvailable(), reserve = remoteFallbackReserve)
                     // Treat an empty/no-speech local result as a failure so we fall back to
                     // remote, as remote is more accurate.
-                    validateContainsSpeech(text, configuredModel)
-                    RoutedResult(text, sttMode, configuredModel)
+                    validateContainsSpeech(text, activeLocalModel)
+                    RoutedResult(text, sttMode, activeLocalModel)
                 } catch (e: TimeoutCancellationException) {
                     logger.w(e) { "Local transcription timed out, falling back to remote: ${e.message}" }
                     val result = remote(willFallbackLocal = false)

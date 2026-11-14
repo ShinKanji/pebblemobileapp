@@ -1,12 +1,21 @@
 package coredevices.ring.model
 
+import DocumentAttachment
 import android.content.Context
 import co.touchlab.kermit.Logger
 import com.cactus.cactusSetTelemetryEnvironment
 import coredevices.util.CommonBuildKonfig
 import coredevices.util.models.promoteSingleRootDir
 import coredevices.util.models.weightsVersionFor
+import coredevices.util.transcription.ImportedModel
+import kotlinx.io.asInputStream
 import kotlinx.io.files.Path
+import kotlinx.io.files.SystemFileSystem
+import kotlinx.io.files.SystemTemporaryDirectory
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.koin.mp.KoinPlatform
@@ -20,6 +29,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
@@ -30,6 +40,8 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
         private const val HF_BASE = "https://huggingface.co/Cactus-Compute"
         private const val QUANTIZATION = "cq4"
         private const val DOWNLOAD_BUFFER_SIZE = 256 * 1024
+        private const val IMPORTED_MARKER = ".imported"
+        private const val NPU_ENCODER_PREFIX = "npu_audio_encoder"
 
         // One mutex per model so an in-progress STT download doesn't head-of-line
         // block an unrelated LM resolve (or vice versa).
@@ -65,7 +77,7 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
     actual override fun getIncompatibleModels(): List<String> {
         val compatible = setOf(CommonBuildKonfig.CACTUS_STT_MODEL, CommonBuildKonfig.CACTUS_STT_MODEL_ENG, CommonBuildKonfig.CACTUS_LM_MODEL_NAME)
         return getDownloadedModels().filter { name ->
-            modelNeedsReplacement(name, compatible, versionMatches(name), isBundled(name))
+            !isImported(name) && modelNeedsReplacement(name, compatible, versionMatches(name), isBundled(name))
         }
     }
 
@@ -89,6 +101,13 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
 
     private suspend fun resolveModelPath(modelName: String, version: String): String = mutexFor(modelName).withLock {
         val modelDir = modelsDir.resolve(modelName)
+
+        // User-imported bundles are managed manually: no version tracking, no download.
+        if (isImported(modelName)) {
+            logger.d { "Model '$modelName' (imported) at: ${modelDir.absolutePath}" }
+            return modelDir.absolutePath
+        }
+
         val versionFile = modelDir.resolve(".cactus_version")
 
         val needsDownload = !modelDir.exists()
@@ -103,6 +122,53 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
 
         logger.d { "Model '$modelName' at: ${modelDir.absolutePath}" }
         return modelDir.absolutePath
+    }
+
+    private fun isImported(modelName: String): Boolean =
+        modelsDir.resolve(modelName).resolve(IMPORTED_MARKER).exists()
+
+    /**
+     * Extracts a zip stream into [targetDir] with ZIP-slip protection.
+     * When [totalBytes] is > 0, reports bytes written via [onBytes] so callers can show progress.
+     */
+    private suspend fun extractZipStream(
+        input: InputStream,
+        targetDir: File,
+        totalBytes: Long? = null,
+        onBytes: (Long) -> Unit = {},
+    ) {
+        var written = 0L
+        ZipInputStream(input.buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                currentCoroutineContext().ensureActive()
+                val outputFile = File(targetDir, entry.name)
+                // ZIP Slip protection
+                if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath)) {
+                    throw SecurityException("ZIP entry outside target dir: ${entry.name}")
+                }
+                if (entry.isDirectory) {
+                    outputFile.mkdirs()
+                } else {
+                    outputFile.parentFile?.mkdirs()
+                    FileOutputStream(outputFile).use { fos ->
+                        if (totalBytes == null) {
+                            zis.copyTo(fos)
+                        } else {
+                            val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                            var bytesRead: Int
+                            while (zis.read(buffer).also { bytesRead = it } != -1) {
+                                fos.write(buffer, 0, bytesRead)
+                                written += bytesRead
+                                onBytes(written)
+                            }
+                        }
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
     }
 
     private suspend fun downloadAndExtract(modelName: String, targetDir: File, version: String) = withContext(Dispatchers.IO) {
@@ -192,27 +258,7 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
             targetDir.mkdirs()
 
             // Extract
-            ZipInputStream(tempZip.inputStream().buffered()).use { zis ->
-                var entry = zis.nextEntry
-                while (entry != null) {
-                    currentCoroutineContext().ensureActive()
-                    val outputFile = File(targetDir, entry.name)
-                    // ZIP Slip protection
-                    if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath)) {
-                        throw SecurityException("ZIP entry outside target dir: ${entry.name}")
-                    }
-                    if (entry.isDirectory) {
-                        outputFile.mkdirs()
-                    } else {
-                        outputFile.parentFile?.mkdirs()
-                        FileOutputStream(outputFile).use { fos ->
-                            zis.copyTo(fos)
-                        }
-                    }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
-                }
-            }
+            extractZipStream(tempZip.inputStream(), targetDir)
             promoteSingleRootDir(Path(targetDir.absolutePath))
             logger.i { "Extraction complete to ${targetDir.absolutePath}" }
         } catch (e: CancellationException) {
@@ -246,6 +292,121 @@ actual class CactusModelProvider actual constructor() : coredevices.util.transcr
         } catch (e: Throwable) {
             logger.e(e) { "Failed to initialize telemetry environment" }
         }
+    }
+
+    @Serializable
+    private data class ImportedMarker(val displayName: String)
+
+    private val markerJson = Json { ignoreUnknownKeys = true }
+
+    override suspend fun importModel(source: DocumentAttachment, onProgress: (Float) -> Unit): String = withContext(Dispatchers.IO) {
+        val tmpDir = modelsDir.resolve(".import_tmp_${java.util.UUID.randomUUID()}")
+        try {
+            tmpDir.mkdirs()
+            val totalBytes = source.size.takeIf { it > 0 }
+            var reported = 0f
+            extractZipStream(
+                input = source.source.asInputStream(),
+                targetDir = tmpDir,
+                totalBytes = totalBytes,
+            ) { written ->
+                // totalBytes is null when the provider didn't report a size: progress stays
+                // indeterminate (fraction 0 is never emitted).
+                val fraction = (written.toFloat() / (totalBytes ?: 0L)).coerceIn(0f, 1f)
+                if (fraction - reported >= 0.01f && fraction > 0f) {
+                    reported = fraction
+                    onProgress(fraction)
+                }
+            }
+            promoteSingleRootDir(Path(tmpDir.absolutePath))
+            if (!tmpDir.resolve("config.txt").exists()) {
+                throw IllegalArgumentException("'${source.fileName}' is not a Cactus model bundle: config.txt missing")
+            }
+
+            val name = uniqueImportedName(source.fileName)
+            val displayName = source.fileName.substringAfterLast('/').substringBeforeLast('.').ifBlank { name }
+            tmpDir.resolve(IMPORTED_MARKER).writeText(markerJson.encodeToString(ImportedMarker(displayName = displayName)))
+            if (!tmpDir.renameTo(modelsDir.resolve(name))) {
+                throw IllegalStateException("Failed to finalize import of '$name'")
+            }
+            onProgress(1f)
+            logger.i { "Imported model '$name' from '${source.fileName}'" }
+            name
+        } catch (e: CancellationException) {
+            logger.i { "Model import cancelled for ${source.fileName}" }
+            throw e
+        } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
+            logger.e(e) { "Model import failed for ${source.fileName}" }
+            throw e
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    override fun getImportedModels(): List<ImportedModel> {
+        return modelsDir.listFiles()
+            ?.filter { it.isDirectory && it.resolve(IMPORTED_MARKER).exists() }
+            ?.map { dir ->
+                val displayName = try {
+                    markerJson.decodeFromString<ImportedMarker>(dir.resolve(IMPORTED_MARKER).readText()).displayName
+                } catch (_: Exception) {
+                    dir.name
+                }
+                ImportedModel(
+                    name = dir.name,
+                    displayName = displayName.ifBlank { dir.name },
+                    sizeBytes = getModelSizeBytes(dir.name),
+                    hasNpuEncoder = hasNpuEncoder(dir.name),
+                )
+            } ?: emptyList()
+    }
+
+    override fun hasNpuEncoder(modelName: String): Boolean {
+        val dir = modelsDir.resolve(modelName)
+        return dir.listFiles()?.any { it.isFile && it.name.startsWith(NPU_ENCODER_PREFIX) } == true
+    }
+
+    override fun cleanupTempFiles(): Long {
+        var freed = 0L
+        fun sweep(file: File) {
+            if (!file.exists()) return
+            val size = if (file.isDirectory) file.walkTopDown().sumOf { it.length() } else file.length()
+            if (file.deleteRecursively()) freed += size
+        }
+        // Failed/cancelled imports
+        modelsDir.listFiles()?.forEach { if (it.isDirectory && it.name.startsWith(".import_tmp_")) sweep(it) }
+        // Partial model dirs (missing sentinel), never touching an in-flight download
+        modelsDir.listFiles()?.forEach {
+            if (it.isDirectory && it.name in modelMutexes.keys && mutexFor(it.name).isLocked) return@forEach
+            if (it.isDirectory && !it.name.startsWith(".") && !it.resolve("config.txt").exists()) sweep(it)
+        }
+        // Stale download zips (also skip in-flight downloads)
+        context.cacheDir.listFiles()?.forEach { file ->
+            if (!file.isFile || !file.name.endsWith(".zip")) return@forEach
+            if (!(file.name.startsWith("cactus_download_") || file.name.startsWith("cactus_asset_"))) return@forEach
+            val modelName = file.name.removePrefix("cactus_download_").removePrefix("cactus_asset_").removeSuffix(".zip")
+            if (modelName in modelMutexes.keys && mutexFor(modelName).isLocked) return@forEach
+            sweep(file)
+        }
+        // Transcription temp WAVs
+        SystemFileSystem.delete(Path(SystemTemporaryDirectory, "cactus_stt"), mustExist = false)
+        return freed
+    }
+
+    private fun uniqueImportedName(fileName: String): String {
+        val base = fileName.substringAfterLast('/').substringBeforeLast('.')
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .trim('_', '.')
+            .take(64)
+            .ifBlank { "imported_model" }
+        var candidate = base
+        var i = 2
+        while (modelsDir.resolve(candidate).exists()) {
+            candidate = "$base-$i"
+            i++
+        }
+        return candidate
     }
 
     private fun getCactusCacheDir(): File {

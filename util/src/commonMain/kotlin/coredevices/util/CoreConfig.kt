@@ -133,4 +133,9 @@ data class STTConfig(
     val modelName: String? = null,
     /** ISO 639-1 language code. Null means auto-detect. */
     val spokenLanguage: String? = null,
+    /**
+     * Active LiteRT-LM bundle (imported `.litertlm` file). When set, on-device
+     * transcription runs on the LiteRT engine instead of Cactus; null selects Cactus.
+     */
+    val litertModelName: String? = null,
 )

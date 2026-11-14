@@ -43,6 +43,8 @@ import coredevices.util.transcription.CactusModelPathProvider
 import coredevices.util.transcription.CactusTranscriptionService
 import coredevices.util.transcription.HybridTranscriptionService
 import coredevices.util.transcription.KirinkiTranscriptionService
+import coredevices.util.transcription.LitertModelManager
+import coredevices.util.transcription.LitertTranscriptionService
 import coredevices.util.transcription.LocalTranscriptionService
 import coredevices.util.transcription.PlatformSpeechRecognizer
 import coredevices.util.transcription.TranscriptionService
@@ -125,8 +127,14 @@ val utilModule = module {
         )
     }
     singleOf(::PlatformSpeechRecognizer)
+    singleOf(::LitertModelManager)
+    singleOf(::LitertTranscriptionService)
     single {
-        HybridTranscriptionService(get(), get(), get(), get(), get(), get(), get(), getOrNull<PhoneNetworkMonitor>()?.connection)
+        HybridTranscriptionService(
+            get(), get(), get(), get(), get(), get(), get(),
+            litert = getOrNull(),
+            networkConnection = getOrNull<PhoneNetworkMonitor>()?.connection,
+        )
     } binds arrayOf(TranscriptionService::class, LocalTranscriptionService::class)
     singleOf(::WisprFlowRESTTranscriptionService)
     singleOf(::KirinkiTranscriptionService)

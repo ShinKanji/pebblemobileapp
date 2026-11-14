@@ -1,5 +1,6 @@
 package coredevices.pebble.ui
 
+import DocumentAttachment
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,6 +27,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
@@ -59,6 +61,8 @@ import coredevices.util.models.inProgress
 import coredevices.util.models.ModelInfo
 import coredevices.util.models.ModelManager
 import coredevices.util.models.RecommendedModel
+import coredevices.util.transcription.LitertModel
+import coredevices.util.transcription.LitertModelManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -73,15 +77,18 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.jetbrains.compose.ui.tooling.preview.Preview
 import org.koin.compose.viewmodel.koinViewModel
+import rememberOpenDocumentLauncher
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 
 class ModelManagementScreenViewModel(
     private val modelManager: ModelManager,
     private val coreConfigHolder: CoreConfigHolder,
-    private val settings: Settings
+    private val settings: Settings,
+    private val litertModelManager: LitertModelManager? = null,
 ) : ViewModel() {
     private val _downloadedModels = MutableStateFlow(modelManager.getDownloadedModelSlugs())
     val downloadedModels = _downloadedModels.asStateFlow()
@@ -104,6 +111,18 @@ class ModelManagementScreenViewModel(
         started = kotlinx.coroutines.flow.SharingStarted.Lazily,
         initialValue = coreConfigHolder.config.value.sttConfig.modelName
     )
+
+    val currentLitertModel = coreConfigHolder.config.map { it.sttConfig.litertModelName }.stateIn(
+        viewModelScope,
+        started = kotlinx.coroutines.flow.SharingStarted.Lazily,
+        initialValue = coreConfigHolder.config.value.sttConfig.litertModelName
+    )
+
+    private val _litertModels = MutableStateFlow(litertModelManager?.getModels() ?: emptyList())
+    val litertModels = _litertModels.asStateFlow()
+
+    /** True when the device can run the LiteRT NPU (QNN) backend. */
+    val litertNpuCapable: Boolean get() = litertModelManager?.isNpuCapable() == true
 
     sealed interface AvailableModelsState {
         object Loading : AvailableModelsState
@@ -132,6 +151,7 @@ class ModelManagementScreenViewModel(
     fun deleteModel(slug: String) {
         modelManager.deleteModel(slug)
         refreshDownloadedModels()
+        refreshAvailableModels()
         // With no STT models left, local speech recognition can't run, so fall
         // back to cloud-only and let the user know.
         if (modelManager.getDownloadedSTTModelSlugs().isEmpty() &&
@@ -163,6 +183,53 @@ class ModelManagementScreenViewModel(
         modelManager.cancelDownload()
     }
 
+    private val _importProgress = MutableStateFlow<Float?>(null)
+    val importProgress = _importProgress.asStateFlow()
+
+    fun importModel(source: DocumentAttachment) {
+        if (_importProgress.value != null) return
+        viewModelScope.launch {
+            _importProgress.value = 0f
+            try {
+                if (source.fileName.endsWith(".litertlm", ignoreCase = true)) {
+                    val manager = litertModelManager
+                        ?: throw IllegalStateException("The LiteRT engine is not available on this device")
+                    val name = manager.importModel(source) { progress ->
+                        _importProgress.value = progress
+                    }
+                    setCurrentLitertModel(name)
+                    refreshLitertModels()
+                    _snackbarMessages.tryEmit("LiteRT model imported")
+                } else {
+                    val name = modelManager.importModel(source) { progress ->
+                        _importProgress.value = progress
+                    } ?: throw IllegalStateException("Model import is not supported on this platform")
+                    setCurrentSTTModel(name)
+                    refreshDownloadedModels()
+                    refreshAvailableModels()
+                    _snackbarMessages.tryEmit("Model imported")
+                }
+            } catch (e: Exception) {
+                Logger.e(e) { "Model import failed" }
+                _snackbarMessages.tryEmit("Import failed: ${e.message ?: "Unknown error"}")
+            } finally {
+                _importProgress.value = null
+            }
+        }
+    }
+
+    fun cleanupTempFiles() {
+        viewModelScope.launch {
+            // File scans are cheap; no dispatcher hop needed (Dispatchers.IO is JVM-only and
+            // this ViewModel compiles for iOS too).
+            val freed = (litertModelManager?.cleanupTempFiles() ?: 0L) + modelManager.cleanupTempFiles()
+            _snackbarMessages.tryEmit(
+                if (freed > 0) "Freed ${freed / (1024 * 1024)} MB of temporary files"
+                else "No temporary files to clean"
+            )
+        }
+    }
+
     fun downloadLanguageModel(info: ModelInfo) {
         viewModelScope.launch {
             modelManager.downloadLanguageModel(info, allowMetered = true)
@@ -173,10 +240,39 @@ class ModelManagementScreenViewModel(
     fun setCurrentSTTModel(slug: String) {
         val newConfig = coreConfigHolder.config.value.copy(
             sttConfig = coreConfigHolder.config.value.sttConfig.copy(
-                modelName = slug
+                modelName = slug,
+                // Picking a Cactus model switches the local engine back to Cactus.
+                litertModelName = null,
             )
         )
         coreConfigHolder.update(newConfig)
+    }
+
+    /** Selecting a LiteRT bundle switches on-device transcription to the LiteRT engine. */
+    fun setCurrentLitertModel(name: String) {
+        if (litertModelManager == null) return
+        val newConfig = coreConfigHolder.config.value.copy(
+            sttConfig = coreConfigHolder.config.value.sttConfig.copy(
+                litertModelName = name
+            )
+        )
+        coreConfigHolder.update(newConfig)
+    }
+
+    fun deleteLitertModel(name: String) {
+        litertModelManager?.deleteModel(name)
+        refreshLitertModels()
+        if (coreConfigHolder.config.value.sttConfig.litertModelName == name) {
+            coreConfigHolder.update(
+                coreConfigHolder.config.value.copy(
+                    sttConfig = coreConfigHolder.config.value.sttConfig.copy(litertModelName = null)
+                )
+            )
+        }
+    }
+
+    private fun refreshLitertModels() {
+        _litertModels.value = litertModelManager?.getModels() ?: emptyList()
     }
 
     fun refreshAvailableModels() {
@@ -263,6 +359,13 @@ fun ModelDownloadPromptDialog(
     }
 }
 
+/** Mimetypes accepted by the model import picker; zips are often reported as generic binary. */
+private val IMPORT_MIME_TYPES = listOf(
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+)
+
 @Composable
 fun ModelManagementScreen(
     navBarNav: NavBarNav,
@@ -272,6 +375,14 @@ fun ModelManagementScreen(
     availableSTTModels: State<ModelManagementScreenViewModel.AvailableModelsState>,
     currentSTTModel: State<String?>,
     recommendedSTTModelSlug: String,
+    importProgress: State<Float?>,
+    onImportModel: (DocumentAttachment) -> Unit,
+    onCleanupTempFiles: () -> Unit,
+    litertModels: State<List<LitertModel>>,
+    currentLitertModel: State<String?>,
+    litertNpuCapable: Boolean,
+    onSelectLitertModel: (String) -> Unit,
+    onDeleteLitertModel: (String) -> Unit,
     onDownloadSTTModel: (ModelInfo) -> Unit,
     onCancelDownload: () -> Unit,
     onDeleteModel: (String) -> Unit,
@@ -285,6 +396,9 @@ fun ModelManagementScreen(
     val downloadingModelSlug by remember {
         derivedStateOf { downloadStatus.value.inProgressSlug }
     }
+    val pickModelFile = rememberOpenDocumentLauncher { attachments ->
+        attachments?.firstOrNull()?.let { onImportModel(it) }
+    }
     Box(modifier = Modifier.background(MaterialTheme.colorScheme.background)) {
         Scaffold { paddingValues ->
             LazyColumn(
@@ -294,6 +408,33 @@ fun ModelManagementScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                item(contentType = "import") {
+                    val importing = importProgress.value != null
+                    if (importing) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 32.dp)
+                        ) {
+                            Text("Importing model…")
+                            Spacer(modifier = Modifier.height(8.dp))
+                            LinearProgressIndicator(
+                                progress = { importProgress.value ?: 0f },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    } else {
+                        Button(onClick = { pickModelFile(IMPORT_MIME_TYPES) }) {
+                            Text("Import model from file")
+                        }
+                        Text(
+                            "Cactus zip bundle or LiteRT-LM .litertlm file",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
                 when (val state = availableSTTModels.value) {
                     ModelManagementScreenViewModel.AvailableModelsState.Loading -> {
                         item(contentType = "loading") {
@@ -315,7 +456,7 @@ fun ModelManagementScreen(
                         val reorderedModels = state.models.sortedByDescending {
                             when {
                                 it.slug == recommendedSTTModelSlug -> 3
-                                it.slug == currentSTTModel.value -> 2
+                                it.slug == currentSTTModel.value && currentLitertModel.value == null -> 2
                                 downloadedModels.value.contains(it.slug) -> 1
                                 else -> 0
                             }
@@ -338,7 +479,7 @@ fun ModelManagementScreen(
                                     }
                                     else -> DownloadState.NotDownloaded
                                 },
-                                isSelected = currentSTTModel.value == model.slug,
+                                isSelected = currentSTTModel.value == model.slug && currentLitertModel.value == null,
                                 onDownload = if (downloadingModelSlug == null) {
                                     { onDownloadSTTModel(model) }
                                 } else {
@@ -351,6 +492,54 @@ fun ModelManagementScreen(
                                 onSelect = { onSetCurrentSTTModel(model.slug) }
                             )
                         }
+                    }
+                }
+                if (litertModels.value.isNotEmpty()) {
+                    item(contentType = "litert-header") {
+                        Text(
+                            "LiteRT-LM models (Qwen3-ASR, NPU/GPU/CPU)",
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.padding(top = 16.dp),
+                        )
+                    }
+                    items(litertModels.value, key = { "litert_${it.name}" }) { model ->
+                        val active = currentLitertModel.value == model.name
+                        ListItem(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectLitertModel(model.name) },
+                            headlineContent = { Text(model.displayName) },
+                            supportingContent = {
+                                val tags = buildList {
+                                    add(if (active) "Active engine" else "Tap to use")
+                                    add(if (litertNpuCapable) "NPU/GPU/CPU backends" else "CPU/GPU backends")
+                                }
+                                Text(tags.joinToString(" · "))
+                            },
+                            leadingContent = {
+                                RadioButton(selected = active, onClick = { onSelectLitertModel(model.name) })
+                            },
+                            trailingContent = {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    IconButton(onClick = { onDeleteLitertModel(model.name) }) {
+                                        Icon(
+                                            Icons.Default.Delete,
+                                            contentDescription = "Delete",
+                                            tint = MaterialTheme.colorScheme.error,
+                                        )
+                                    }
+                                    Text(
+                                        "${model.sizeBytes / (1024 * 1024)} MB",
+                                        modifier = Modifier.offset(y = (-8).dp),
+                                    )
+                                }
+                            },
+                        )
+                    }
+                }
+                item(contentType = "cleanup") {
+                    TextButton(onClick = onCleanupTempFiles) {
+                        Text("Clean up temporary files")
                     }
                 }
             }
@@ -383,8 +572,15 @@ private fun ModelListItem(
                 onSelect()
             },
         overlineContent = { if (isRecommended) { Text("Recommended for your device") } },
-        headlineContent = { Text(model.slug) },
-        supportingContent = { model.intendedTask?.let { Text(it) } },
+        headlineContent = { Text(model.displayName ?: model.slug) },
+        supportingContent = {
+            val tags = buildList {
+                if (model.imported) add("Imported")
+                if (model.hasNpuEncoder) add("NPU accelerated")
+                model.intendedTask?.let { add(it) }
+            }
+            if (tags.isNotEmpty()) Text(tags.joinToString(" · "))
+        },
         leadingContent = {
             RadioButton(
                 selected = isSelected && downloadState == DownloadState.Downloaded,
@@ -460,6 +656,9 @@ fun ModelManagementScreen(
     val availableSTTModels = viewModel.availableSTTModels.collectAsState()
     val currentSTTModel = viewModel.currentSTTModel.collectAsState()
     val downloadStatus = viewModel.modelDownloadState.collectAsState()
+    val importProgress = viewModel.importProgress.collectAsState()
+    val litertModels = viewModel.litertModels.collectAsState()
+    val currentLitertModel = viewModel.currentLitertModel.collectAsState()
     val recommendedSTTModel = remember { viewModel.getRecommendedSTTModel() }
 
     LaunchedEffect(viewModel, topBarParams) {
@@ -474,6 +673,14 @@ fun ModelManagementScreen(
         availableSTTModels = availableSTTModels,
         currentSTTModel = currentSTTModel,
         recommendedSTTModelSlug = recommendedSTTModel.modelSlug,
+        importProgress = importProgress,
+        onImportModel = viewModel::importModel,
+        onCleanupTempFiles = viewModel::cleanupTempFiles,
+        litertModels = litertModels,
+        currentLitertModel = currentLitertModel,
+        litertNpuCapable = viewModel.litertNpuCapable,
+        onSelectLitertModel = viewModel::setCurrentLitertModel,
+        onDeleteLitertModel = viewModel::deleteLitertModel,
         onDownloadSTTModel = viewModel::downloadSTTModel,
         onCancelDownload = viewModel::cancelDownload,
         onDeleteModel = viewModel::deleteModel,
@@ -500,6 +707,14 @@ fun ModelManagementScreenPreview() {
             ),
             currentSTTModel = mutableStateOf("whisper-small"),
             recommendedSTTModelSlug = "whisper-medium-pro",
+            importProgress = mutableStateOf<Float?>(null),
+            onImportModel = {},
+            onCleanupTempFiles = {},
+            litertModels = mutableStateOf(emptyList()),
+            currentLitertModel = mutableStateOf(null),
+            litertNpuCapable = false,
+            onSelectLitertModel = {},
+            onDeleteLitertModel = {},
             onDownloadSTTModel = {},
             onCancelDownload = {},
             onDeleteModel = {},
