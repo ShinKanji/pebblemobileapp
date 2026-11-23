@@ -150,7 +150,8 @@ val watchModule = module {
             return this@single.get()
         }
     } } bind PebbleAccountProvider::class
-    singleOf(::PebbleAppDelegate)
+    // Too many params for singleOf
+    single { PebbleAppDelegate(get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
     singleOf(::BundledAppMigration)
     singleOf(::PermissionSettingsSync)
     singleOf(::PermissionDecisionSync)
@@ -184,7 +185,7 @@ val watchModule = module {
     }
     single {
         object : LibPebbleLockerProxy {
-            fun activeWatch() = get<LibPebble>().watches.value.filterIsInstance<ConnectedPebbleDevice>().firstOrNull()
+            suspend fun activeWatch() = get<LibPebble>().watches.first().filterIsInstance<ConnectedPebbleDevice>().firstOrNull()
 
             override fun getAllLockerUuids(): Flow<List<Uuid>> {
                 return get<LibPebble>().getAllLockerUuids()
@@ -221,6 +222,7 @@ val watchModule = module {
     factoryOf(::RealBootConfigProvider) bind BootConfigProvider::class
     factoryOf(::RealPebbleWebServices) binds arrayOf(WebServices::class, PebbleWebServices::class)
     singleOf(::RealPebbleDeepLinkHandler) bind PebbleDeepLinkHandler::class
+    singleOf(::UiWatches)
     factory {
         PebbleHttpClient(pebbleAccount = get(), httpClient = get(), libPebble = lazy { get() })
     } bind PebbleBootConfigService::class

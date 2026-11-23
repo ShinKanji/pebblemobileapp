@@ -41,13 +41,14 @@ class WatchStatePlugin(
         item: String,
         properties: List<String>?,
         iconPixelSize: IconPixelSize?,
+        limit: Int?,
     ): Flow<SourceEnvelope> {
         if (category != CATEGORY || item != ITEM_APP) return emptyFlow()
         return locker.getAllLockerBasicInfo().map(::appsEnvelope)
     }
 
     override suspend fun invoke(action: String, args: JsonObject): ActionResult {
-        val connected = watches.watches.value.filterIsInstance<ConnectedPebbleDevice>()
+        val connected = watches.watches.first().filterIsInstance<ConnectedPebbleDevice>()
         return when (action) {
             ACTION_LAUNCH_APP -> {
                 val uuid = (args[PARAM_UUID] ?: args[ActionDeclaration.PARAM_INSTANCE_ID])

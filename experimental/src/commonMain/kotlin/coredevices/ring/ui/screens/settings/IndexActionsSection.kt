@@ -22,10 +22,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Checklist
@@ -84,10 +86,12 @@ import coredevices.ring.agent.IndexAction
 import coredevices.ring.agent.IndexPlugin
 import coredevices.ring.agent.NOT_CONNECTED_REASON
 import coredevices.ring.agent.builtin_servlets.calendar.CalendarServlet
+import coredevices.ring.agent.builtin_servlets.bugreport.BugReportServlet
 import coredevices.ring.agent.builtin_servlets.clock.ClockServlet
 import coredevices.ring.agent.builtin_servlets.messaging.MessagingServlet
 import coredevices.ring.agent.builtin_servlets.notifications.NotificationReplyServlet
 import coredevices.ring.agent.builtin_servlets.notes.NoteServlet
+import coredevices.ring.agent.builtin_servlets.reminders.ListServlet
 import coredevices.ring.agent.builtin_servlets.reminders.ReminderServlet
 import coredevices.ring.agent.integrations.providers.BuiltInIntegrationProviders
 import coredevices.ring.agent.integrations.providers.IntegrationProvider
@@ -98,6 +102,7 @@ import coredevices.indexai.data.entity.mcp.HttpMcpServerEntity
 import coredevices.ring.service.button.GestureDestination
 import coredevices.ring.service.button.RingGesture
 import coredevices.ring.ui.components.SectionHeader
+import coredevices.ring.ui.screens.settings.geofence.GeofenceLocationsListDialog
 import coredevices.ring.ui.screens.settings.mcp.HttpServerEditDialog
 import coredevices.ring.ui.theme.IndexTheme
 import coredevices.ring.ui.theme.toggleButtonColors
@@ -166,6 +171,11 @@ private fun presentationFor(action: IndexAction): ActionPresentation = when (act
         "Reminders",
         "“Remind me to call Mom at 5pm”",
     )
+    ListServlet.NAME -> ActionPresentation(
+        Icons.AutoMirrored.Filled.FormatListBulleted,
+        "Lists",
+        "“Add milk to my shopping list”",
+    )
     CalendarServlet.NAME -> ActionPresentation(
         Icons.Default.CalendarMonth,
         "Calendar",
@@ -185,6 +195,11 @@ private fun presentationFor(action: IndexAction): ActionPresentation = when (act
         Icons.AutoMirrored.Filled.Reply,
         "Reply to Notifications",
         "“Reply on my way” → reply to the notification on your Pebble watch",
+    )
+    BugReportServlet.NAME -> ActionPresentation(
+        Icons.Default.BugReport,
+        "Bug Reports",
+        "“Create a bug report for Index, the light didn’t turn on” → sends a bug report",
     )
     else -> ActionPresentation(Icons.Default.Power, action.title, "")
 }
@@ -233,10 +248,10 @@ internal fun pluginToggleChanges(plugin: IndexPlugin): List<Pair<PluginGrant, Bo
         .map { it to target }
 }
 
-private enum class ActionsSheet { CaptureType, NoteDestination, ReminderDestination }
+private enum class ActionsSheet { CaptureType, NoteDestination, ReminderDestination, ListDestination }
 internal enum class ActionsDialog {
     AddServer, Sideload, Notion, NotionPage, GoogleTasks, Obsidian, Tasker, PhoneCalendar,
-    TargetCalendar,
+    TargetCalendar, SavedPlaces,
 }
 
 @Composable
@@ -249,11 +264,12 @@ internal fun IndexActionsSection(
     captureType: DefaultCaptureType,
     noteProvider: IntegrationProvider,
     reminderProvider: IntegrationProvider,
+    listProvider: IntegrationProvider,
     approvedContactCount: Int,
     noteDestinations: List<DestinationItem>,
     reminderDestinations: List<DestinationItem>,
+    listDestinations: List<DestinationItem>,
     lockerPlugins: Set<Uuid>,
-    pluginsEnabled: Boolean,
     onSetActionEnabled: (name: String, enabled: Boolean) -> Unit,
     onSetPluginGrantEnabled: (uuid: Uuid, grant: PluginGrant, enabled: Boolean) -> Unit,
     onSetHttpServerEnabled: (server: HttpMcpServerEntity, enabled: Boolean) -> Unit,
@@ -262,14 +278,18 @@ internal fun IndexActionsSection(
     onSetCaptureType: (DefaultCaptureType) -> Unit,
     onSelectNoteProvider: (IntegrationProvider) -> Unit,
     onSelectReminderProvider: (IntegrationProvider) -> Unit,
+    onSelectListProvider: (IntegrationProvider) -> Unit,
     onNoteConnectStarted: (providerId: String) -> Unit,
     onReminderConnectStarted: (providerId: String) -> Unit,
+    onListConnectStarted: (providerId: String) -> Unit,
     onReviewInstall: suspend (StorePlugin) -> InstallReview?,
     onInstallStorePlugin: suspend (StorePlugin, granted: Map<String, Boolean?>) -> Boolean,
     onAddIntegration: () -> Unit,
     onConfigurePlugin: (uuid: Uuid, title: String) -> Unit,
     onOpenPluginPage: (uuid: Uuid) -> Unit,
     onOpenBeeperContacts: () -> Unit,
+    /** A null id creates a new place. */
+    onEditGeofenceLocation: (uuid: Uuid?) -> Unit,
     onGetMoreActions: () -> Unit,
     /** Null where the user can't browse plugins yet, e.g. onboarding; a hint is shown instead. */
     onGetMorePlugins: (() -> Unit)?,
@@ -327,13 +347,14 @@ internal fun IndexActionsSection(
                 destinationLabel = when (action.name) {
                     NoteServlet.NAME -> noteProvider.notesTitle
                     ReminderServlet.NAME -> reminderProvider.remindersTitle
+                    ListServlet.NAME -> listProvider.listsTitle
                     else -> null
                 },
                 onDestinationClick = {
-                    sheet = if (action.name == NoteServlet.NAME) {
-                        ActionsSheet.NoteDestination
-                    } else {
-                        ActionsSheet.ReminderDestination
+                    sheet = when (action.name) {
+                        NoteServlet.NAME -> ActionsSheet.NoteDestination
+                        ListServlet.NAME -> ActionsSheet.ListDestination
+                        else -> ActionsSheet.ReminderDestination
                     }
                 },
                 onSettings = when {
@@ -341,6 +362,9 @@ internal fun IndexActionsSection(
                     action.name == MessagingServlet.name -> onOpenBeeperContacts
                     action.name == CalendarServlet.NAME -> {
                         { dialog = ActionsDialog.TargetCalendar }
+                    }
+                    action.name == ReminderServlet.NAME && reminderProvider.storesItemsLocally -> {
+                        { dialog = ActionsDialog.SavedPlaces }
                     }
                     else -> null
                 },
@@ -377,7 +401,7 @@ internal fun IndexActionsSection(
         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         // The Actions store is future expansion and ships disabled.
         // GetMoreActionsRow(onClick = onGetMoreActions)
-        if (pluginsEnabled && onGetMorePlugins != null) {
+        if (onGetMorePlugins != null) {
             SectionActionRow(
                 icon = Icons.Default.Power,
                 title = "Add plugin integration",
@@ -385,7 +409,7 @@ internal fun IndexActionsSection(
                 enabled = true,
                 onClick = onGetMorePlugins,
             )
-        } else if (pluginsEnabled) {
+        } else {
             SectionActionRow(
                 icon = Icons.Default.Power,
                 title = "Add plugin integration",
@@ -425,7 +449,6 @@ internal fun IndexActionsSection(
             title = "Where notes save",
             items = noteDestinations,
             hasDialog = { noteConfigureDialog(it) != null },
-            pluginsEnabled = pluginsEnabled,
             onGetMore = onGetMorePlugins,
             selected = noteProvider,
             onSelect = onSelectNoteProvider,
@@ -448,30 +471,34 @@ internal fun IndexActionsSection(
             },
             onDismiss = { sheet = null },
         )
-        ActionsSheet.ReminderDestination -> DestinationSheet(
-            icon = Icons.Default.Checklist,
-            title = "Where reminders save",
-            items = reminderDestinations,
-            pluginsEnabled = pluginsEnabled,
-            onGetMore = onGetMorePlugins,
-            selected = reminderProvider,
-            onSelect = onSelectReminderProvider,
-            onConnect = { provider ->
-                onReminderConnectStarted(provider.id)
-                when (provider) {
-                    is PblPluginIntegrationProvider -> onConfigurePlugin(provider.pluginUuid, provider.title)
-                    else -> reminderConnectDialog(provider)?.let { dialog = it } ?: onAddIntegration()
-                }
-            },
-            onInstall = { plugin ->
-                onReminderConnectStarted(PblPluginIntegrationProvider.idFor(plugin.pluginUuid))
-                installer.install(plugin)
-            },
-            onConfigure = { provider ->
-                if (provider is PblPluginIntegrationProvider) onOpenPluginPage(provider.pluginUuid)
-            },
-            onDismiss = { sheet = null },
-        )
+        // Lists are kept by the reminder providers, so both pick from and connect the same ones.
+        ActionsSheet.ReminderDestination, ActionsSheet.ListDestination -> {
+            val lists = sheet == ActionsSheet.ListDestination
+            val onConnectStarted = if (lists) onListConnectStarted else onReminderConnectStarted
+            DestinationSheet(
+                icon = if (lists) Icons.AutoMirrored.Filled.FormatListBulleted else Icons.Default.Checklist,
+                title = if (lists) "Where list items save" else "Where reminders save",
+                items = if (lists) listDestinations else reminderDestinations,
+                onGetMore = onGetMorePlugins,
+                selected = if (lists) listProvider else reminderProvider,
+                onSelect = if (lists) onSelectListProvider else onSelectReminderProvider,
+                onConnect = { provider ->
+                    onConnectStarted(provider.id)
+                    when (provider) {
+                        is PblPluginIntegrationProvider -> onConfigurePlugin(provider.pluginUuid, provider.title)
+                        else -> reminderConnectDialog(provider)?.let { dialog = it } ?: onAddIntegration()
+                    }
+                },
+                onInstall = { plugin ->
+                    onConnectStarted(PblPluginIntegrationProvider.idFor(plugin.pluginUuid))
+                    installer.install(plugin)
+                },
+                onConfigure = { provider ->
+                    if (provider is PblPluginIntegrationProvider) onOpenPluginPage(provider.pluginUuid)
+                },
+                onDismiss = { sheet = null },
+            )
+        }
         null -> {}
     }
 
@@ -513,6 +540,17 @@ internal fun IndexActionsSection(
             onConnected = { dialog = ActionsDialog.TargetCalendar },
         )
         ActionsDialog.TargetCalendar -> TargetCalendarDialog(onDismiss = { dialog = null })
+        ActionsDialog.SavedPlaces -> GeofenceLocationsListDialog(
+            onAdd = {
+                dialog = null
+                onEditGeofenceLocation(null)
+            },
+            onEdit = { uuid ->
+                dialog = null
+                onEditGeofenceLocation(uuid)
+            },
+            onDismissRequest = { dialog = null },
+        )
         null -> {}
     }
 }
@@ -1056,7 +1094,6 @@ private fun DestinationSheet(
     icon: ImageVector,
     title: String,
     items: List<DestinationItem>,
-    pluginsEnabled: Boolean,
     onGetMore: (() -> Unit)?,
     selected: IntegrationProvider,
     onSelect: (IntegrationProvider) -> Unit,
@@ -1122,7 +1159,7 @@ private fun DestinationSheet(
                     },
                 )
             }
-            if (pluginsEnabled && onGetMore != null) {
+            if (onGetMore != null) {
                 TextButton(
                     onClick = {
                         onDismiss()
@@ -1132,7 +1169,7 @@ private fun DestinationSheet(
                 ) {
                     Text("Get more")
                 }
-            } else if (pluginsEnabled) {
+            } else {
                 AddMoreLaterHint(
                     modifier = Modifier
                         .align(Alignment.CenterHorizontally)

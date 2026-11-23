@@ -16,7 +16,7 @@ import io.rebble.libpebblecommon.database.entity.OverlayDataEntity
 import io.rebble.libpebblecommon.database.entity.getWatchSettings
 import io.rebble.libpebblecommon.database.entity.setImperialUnits
 import io.rebble.libpebblecommon.database.entity.setWatchSettings
-import io.rebble.libpebblecommon.database.entity.updateHeartRateZonesFromAge
+import io.rebble.libpebblecommon.database.entity.updateAgeDerivedSettings
 import io.rebble.libpebblecommon.datalogging.HealthDataProcessor
 import io.rebble.libpebblecommon.di.LibPebbleCoroutineScope
 import io.rebble.libpebblecommon.services.DailySleep
@@ -30,6 +30,7 @@ import io.rebble.libpebblecommon.services.updateHealthStatsInDatabase
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import kotlinx.datetime.DatePeriod
@@ -65,7 +66,7 @@ class Health(
 
     fun init() {
         libPebbleCoroutineScope.launch {
-            healthSettingsDao.updateHeartRateZonesFromAge()
+            healthSettingsDao.updateAgeDerivedSettings()
         }
         startPeriodicStatsUpdate()
     }
@@ -126,7 +127,7 @@ class Health(
 
     override fun requestHealthData(fullSync: Boolean) {
         libPebbleCoroutineScope.launch {
-            val device = watchManager.watches.value.filterIsInstance<ConnectedPebbleDevice>().firstOrNull()
+            val device = watchManager.watches.first().filterIsInstance<ConnectedPebbleDevice>().firstOrNull()
             device?.requestHealthData(fullSync)
         }
     }
@@ -162,6 +163,7 @@ class Health(
                 delay(delayUntilMorning)
 
                 logger.d { "HEALTH_STATS: Running scheduled daily stats update" }
+                healthSettingsDao.updateAgeDerivedSettings()
                 updateHealthStats()
             }
         }
@@ -449,6 +451,7 @@ data class HealthSettings(
     val activityInsightsEnabled: Boolean,
     val sleepInsightsEnabled: Boolean,
     val ageYears: Int,
+    val birthYear: Int? = null,
     val gender: HealthGender,
     val imperialUnits: Boolean,
     // ActivityHRMSettings
